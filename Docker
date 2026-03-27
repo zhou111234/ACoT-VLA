@@ -1,0 +1,65 @@
+# ---- 1. 基础镜像：改为官方 Ubuntu 22.04 ----
+FROM ubuntu:22.04
+
+# 设置环境变量，避免 apt 安装时的交互弹窗
+ENV DEBIAN_FRONTEND=noninteractive
+
+WORKDIR /app
+
+# ---- 2. 系统依赖（增加了 python3.11 的安装，因为官方镜像比较纯净） ----
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt-get update -qq && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-dev \
+    python3.11-venv \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libosmesa6-dev \
+    libglfw3 \
+    libglfw3-dev \
+    patchelf \
+    git \
+    git-lfs \
+    build-essential \
+    curl \
+    ca-certificates \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- 3. 下载并安装 uv（确保之前已经 apt-get install 了 curl） ----
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# ---- 4. 关键：将 uv 的路径加入系统环境变量 ----
+ENV PATH="/root/.local/bin:${PATH}"
+
+# ---- 5. 验证一下，如果这行能跑通，说明路径对了 ----
+RUN uv --version
+
+# ---- 6. 拷贝代码（含子模块） ----
+COPY . /app/ACoT-VLA
+WORKDIR /app/ACoT-VLA
+
+# ---- 7. 然后再执行同步（设置清华源加速 Python 包下载） ----
+ENV UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+RUN GIT_LFS_SKIP_SMUDGE=1 uv sync
+RUN GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+
+# ---- 8. 覆盖安装 JAX GPU 版 ----
+# 注意：这里直接指定 venv 路径下的 pip
+RUN /app/ACoT-VLA/.venv/bin/pip uninstall jax jaxlib -y && \
+    /app/ACoT-VLA/.venv/bin/pip install "jax[cuda12_pip]" \
+    -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+
+# ---- 9. 打 transformers 补丁 ----
+RUN cp -r /app/ACoT-VLA/src/openpi/models_pytorch/transformers_replace/* \
+    /app/ACoT-VLA/.venv/lib/python3.11/site-packages/transformers/
+
+# ---- 10. 环境变量 ----
+ENV XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
+# 修正了之前警告的变量引用问题
+ENV PYTHONPATH="/app/ACoT-VLA/src"
+
+# ---- 默认入口：policy server ----
+CMD ["bash", "scripts/server.sh", "0", "8000"]

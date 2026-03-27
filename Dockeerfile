@@ -1,0 +1,111 @@
+# ================================================================
+# Stage 1: 构建阶段 - 注入 uv 工具
+# ================================================================
+FROM ghcr.io/astral-sh/uv:0.6.0 AS uv-binary
+
+# ================================================================
+# Stage 2: 安装阶段（编译环境）
+# 建议改用 nvidia/cuda 确保编译时能找到 GPU 相关头文件
+# ================================================================
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
+# 从 uv 镜像直接 COPY
+COPY --from=uv-binary /uv /uvx /usr/local/bin/
+
+# 系统依赖：补齐了 gnupg, FFmpeg 7 仓库, 以及 av 编译所需的 dev 库
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+    gnupg \
+    ca-certificates \
+    curl \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
+    && add-apt-repository ppa:ubuntuhandbook1/ffmpeg7 -y \
+    && apt-get update -qq && apt-get install -y --no-install-recommends \
+    # Python 环境
+    python3.11 \
+    python3.11-dev \
+    python3.11-venv \
+    # 编译 av (PyAV) 必需的工具和 FFmpeg 7 开发库
+    pkg-config \
+    libavcodec-dev \
+    libavdevice-dev \
+    libavfilter-dev \
+    libavformat-dev \
+    libavutil-dev \
+    libswresample-dev \
+    libswscale-dev \
+    # MuJoCo / OpenGL / 渲染
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libosmesa6-dev \
+    libglfw3 \
+    libglfw3-dev \
+    patchelf \
+    # 基础构建工具
+    build-essential \
+    git \
+    git-lfs \
+    ffmpeg \
+    && git lfs install \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . /app/ACoT-VLA
+WORKDIR /app/ACoT-VLA
+
+# 使用清华源加速 uv sync
+ENV UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+RUN GIT_LFS_SKIP_SMUDGE=1 uv sync && GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+
+# 覆盖安装 JAX CUDA12 版
+RUN .venv/bin/pip uninstall jax jaxlib -y \
+    && .venv/bin/pip install "jax[cuda12_pip]" \
+    -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+
+# transformers 补丁
+RUN cp -r src/openpi/models_pytorch/transformers_replace/* \
+    .venv/lib/python3.11/site-packages/transformers/
+
+# ================================================================
+# Stage 3: 运行阶段（最小化）
+# ================================================================
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
+# 修正变量引用，避免警告
+ENV PYTHONPATH="/app/ACoT-VLA/src"
+ENV VIRTUAL_ENV=/app/ACoT-VLA/.venv
+ENV PATH="/app/ACoT-VLA/.venv/bin:${PATH}"
+
+# 运行时仅需基础库和 FFmpeg 7 运行时
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    && add-apt-repository ppa:ubuntuhandbook1/ffmpeg7 -y \
+    && apt-get update -qq && apt-get install -y --no-install-recommends \
+    python3.11 \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libosmesa6-dev \
+    libglfw3 \
+    ffmpeg \
+    ca-certificates \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 从 builder 拷贝
+COPY --from=builder /app/ACoT-VLA/.venv          /app/ACoT-VLA/.venv
+COPY --from=builder /app/ACoT-VLA/src            /app/ACoT-VLA/src
+COPY --from=builder /app/ACoT-VLA/scripts        /app/ACoT-VLA/scripts
+COPY --from=builder /app/ACoT-VLA/pyproject.toml /app/ACoT-VLA/pyproject.toml
+COPY --from=builder /app/ACoT-VLA/packages       /app/ACoT-VLA/packages
+
+WORKDIR /app/ACoT-VLA
+
+EXPOSE 8000
+CMD ["bash", "scripts/server.sh", "0", "8000"]

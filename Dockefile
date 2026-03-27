@@ -1,0 +1,109 @@
+# ================================================================
+# Stage 1: 工具注入阶段
+# ================================================================
+FROM ghcr.io/astral-sh/uv:0.6.0 AS uv-binary
+
+# ================================================================
+# Stage 2: 安装/编译阶段 (Builder)
+# 使用华为云 (NVIDIA 官方同步) 开发版镜像
+# ================================================================
+FROM swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PATH="/root/.local/bin:${PATH}"
+
+# 从 uv 镜像复制二进制文件
+COPY --from=uv-binary /uv /uvx /usr/local/bin/
+
+# 系统依赖补齐
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-dev \
+    python3.11-venv \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libosmesa6-dev \
+    libglfw3 \
+    libglfw3-dev \
+    patchelf \
+    build-essential \
+    git \
+    git-lfs \
+    ffmpeg \
+    ca-certificates \
+    && git lfs install \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . /app/ACoT-VLA
+WORKDIR /app/ACoT-VLA
+
+# --- 核心修改部分：镜像加速、禁用校验、增加重试 ---
+
+# 1. 替换 GitHub 地址为稳定中转源 (github.moeyy.xyz)
+# 2. 禁用 SSL 校验以防止由于证书问题导致的 128 错误
+# 3. 增加 Git 缓冲区和低速重试等待，防止大仓库拉取中断
+RUN git config --global http.sslVerify false && \
+    git config --global http.postBuffer 524288000 && \
+    git config --global http.lowSpeedLimit 0 && \
+    git config --global http.lowSpeedTime 999999 && \
+    sed -i 's|https://github.com/|https://github.moeyy.xyz/https://github.com/|g' pyproject.toml && \
+    ( [ -f uv.lock ] && sed -i 's|https://github.com/|https://github.moeyy.xyz/https://github.com/|g' uv.lock || echo "No uv.lock found" )
+
+# uv sync：使用清华源，并设置 GIT_SSL_NO_VERIFY=true 环境变量
+ENV UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+RUN GIT_SSL_NO_VERIFY=true GIT_LFS_SKIP_SMUDGE=1 uv sync \
+    && GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+
+# --- 结束修改部分 ---
+
+# 覆盖安装 JAX CUDA12 GPU 版
+RUN .venv/bin/pip uninstall jax jaxlib -y \
+    && .venv/bin/pip install "jax[cuda12_pip]" \
+        -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+
+# transformers 补丁
+RUN cp -r src/openpi/models_pytorch/transformers_replace/* \
+    .venv/lib/python3.11/site-packages/transformers/
+
+# ================================================================
+# Stage 3: 运行阶段 (Runtime)
+# ================================================================
+FROM swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
+ENV PYTHONPATH="/app/ACoT-VLA/src"
+ENV VIRTUAL_ENV=/app/ACoT-VLA/.venv
+ENV PATH="/app/ACoT-VLA/.venv/bin:${PATH}"
+
+# JAX 通过 XLA 找库
+ENV LD_LIBRARY_PATH="/app/ACoT-VLA/.venv/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:${LD_LIBRARY_PATH}"
+
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+    python3.11 \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libosmesa6-dev \
+    libglfw3 \
+    ffmpeg \
+    ca-certificates \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python \
+    && rm -rf /var/lib/apt/lists/*
+
+# 从 builder 拷贝
+COPY --from=builder /app/ACoT-VLA/.venv          /app/ACoT-VLA/.venv
+COPY --from=builder /app/ACoT-VLA/src            /app/ACoT-VLA/src
+COPY --from=builder /app/ACoT-VLA/scripts        /app/ACoT-VLA/scripts
+COPY --from=builder /app/ACoT-VLA/pyproject.toml /app/ACoT-VLA/pyproject.toml
+COPY --from=builder /app/ACoT-VLA/packages       /app/ACoT-VLA/packages
+
+WORKDIR /app/ACoT-VLA
+
+EXPOSE 8000
+CMD ["bash", "scripts/server.sh", "0", "8000"]
